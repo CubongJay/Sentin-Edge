@@ -1,23 +1,24 @@
-import os
-from pathlib import Path
-from datetime import datetime, timezone
 import json
+import os
 import uuid
-
-from langchain_core.tools import tool
-from tavily import TavilyClient
-from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from dotenv import load_dotenv
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
-
-from langchain.agents import create_agent
+from datetime import datetime, timezone
+from pathlib import Path
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
 from azure.storage.blob import BlobServiceClient
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from tavily import TavilyClient
+from tavily.errors import ForbiddenError
+
+from envelope import check
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -86,8 +87,20 @@ def get_news(stock: str) -> dict:
 
         combined_articles = "\n".join(articles_text)
         return {"ok": True, "error": None, "data": combined_articles}
+    except ForbiddenError as e:
+        detail = str(e).strip()
+        msg = (
+            f"Tavily 403 Forbidden: {detail}"
+            if detail
+            else "Tavily 403 Forbidden (check plan/credits)"
+        )
+        return {"ok": False, "error": msg, "data": None}
+
     except Exception as e:
-        return {"ok": False, "error": str(e), "data": None}
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        body = getattr(getattr(e, "response", None), "text", None)
+        msg = str(e).strip() or f"{type(e).__name__} (status={status}): {body or e!r}"
+        return {"ok": False, "error": msg, "data": None}
 
 
 @tool
@@ -169,7 +182,11 @@ def execute_trade(symbol: str, side: str, notional: float = 1.0):
         }
     """
 
+    decision = check(symbol, side, notional)
+    if not decision["ok"]:
+        return decision
     try:
+
         clock = trading_client.get_clock()
         if not clock.is_open:
 
@@ -278,7 +295,7 @@ def run_sentinedge_agent(watchlist_stocks: list):
                 )
             ]
         },
-        config={"recursion_limit": 10},
+        config={"recursion_limit": 50},
     )
     timestamp_end = datetime.now(timezone.utc).isoformat()
     print("\n" + "=" * 40)
@@ -328,6 +345,21 @@ def run_sentinedge_agent(watchlist_stocks: list):
 
     final_report = response["messages"][-1].content
 
+    envelope_decisions = [
+        {
+            "symbol": tc["args"]["symbol"],
+            "side": tc["args"]["side"],
+            "notional": tc["args"].get("notional", 1.0),
+            "decision": check(
+                tc["args"]["symbol"],
+                tc["args"]["side"],
+                tc["args"].get("notional", 1.0),
+            ),
+        }
+        for tc in tool_calls
+        if tc["name"] == "execute_trade"
+    ]
+
     audit_trail = {
         "run_id": str(uuid.uuid4()),
         "timestamp_start": timestamp_start,
@@ -341,7 +373,7 @@ def run_sentinedge_agent(watchlist_stocks: list):
         ],
         "final_report": final_report,
         "outcome": outcome,
-        "envelope_decisions": [],
+        "envelope_decisions": envelope_decisions,
     }
 
     ts_for_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -360,5 +392,5 @@ def run_sentinedge_agent(watchlist_stocks: list):
 if __name__ == "__main__":
 
     print("Launching SentinEdge Agent...")
-    final_report = run_sentinedge_agent(["TSLA, AAPL"])
+    final_report = run_sentinedge_agent(["NVDA"])
     print("\n[FINAL REPORT]:\n", final_report)
