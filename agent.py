@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
+from datetime import datetime, timezone
+import json
+import uuid
 
 from langchain_core.tools import tool
 from tavily import TavilyClient
 from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from dotenv import load_dotenv
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -14,6 +17,7 @@ from langchain.agents import create_agent
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading import TradingClient
+from azure.storage.blob import BlobServiceClient
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -27,6 +31,12 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 trading_client = TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=True)
 
 data_client = StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+
+
+blob_service = BlobServiceClient.from_connection_string(
+    os.getenv("BLOB_CONNECTION_STRING")
+)
+runs_container = blob_service.get_container_client("runs")
 
 
 @tool
@@ -158,7 +168,7 @@ def execute_trade(symbol: str, side: str, notional: float = 1.0):
             # or {"next_open": str} when the market is closed
         }
     """
-    # 1. Market hours gate — the important bit
+
     try:
         clock = trading_client.get_clock()
         if not clock.is_open:
@@ -169,7 +179,6 @@ def execute_trade(symbol: str, side: str, notional: float = 1.0):
                 "data": {"next_open": str(clock.next_open)},
             }
 
-        # 2. Validate side before touching Alpaca
         side_l = side.lower()
         if side_l not in ("buy", "sell"):
 
@@ -260,7 +269,7 @@ def run_sentinedge_agent(watchlist_stocks: list):
     Kicks off the autonomous agent workflow for a list of target tickers.
     """
     stocks_input = ", ".join(watchlist_stocks)
-
+    timestamp_start = datetime.now(timezone.utc).isoformat()
     response = agent_executor.invoke(
         {
             "messages": [
@@ -271,7 +280,7 @@ def run_sentinedge_agent(watchlist_stocks: list):
         },
         config={"recursion_limit": 10},
     )
-
+    timestamp_end = datetime.now(timezone.utc).isoformat()
     print("\n" + "=" * 40)
     print("AGENT EXECUTION PATH")
     print("=" * 40)
@@ -281,14 +290,75 @@ def run_sentinedge_agent(watchlist_stocks: list):
             for tc in msg.tool_calls:
                 print(f"  🔧 Tool Call: {tc['name']} with args {tc['args']}")
         if hasattr(msg, "content"):
-            # For ToolMessage, this is the result. For AIMessage, this is text/reasoning.
+
             print(f"  Content: {msg.content[:500]}...")  # Truncate long content
 
+    results_by_id = {
+        msg.tool_call_id: msg.content
+        for msg in response["messages"]
+        if isinstance(msg, ToolMessage)
+    }
+
+    tool_calls = [
+        {
+            "name": tc["name"],
+            "args": tc["args"],
+            "result": (
+                json.loads(results_by_id[tc["id"]])
+                if tc["id"] in results_by_id
+                else None
+            ),
+        }
+        for msg in response["messages"]
+        if isinstance(msg, AIMessage) and msg.tool_calls
+        for tc in msg.tool_calls
+    ]
+
+    trade_results = [
+        tc["result"]
+        for tc in tool_calls
+        if tc["name"] == "execute_trade" and tc["result"]
+    ]
+    if not trade_results:
+        outcome = "held"
+    elif any(r["ok"] for r in trade_results):
+        outcome = "traded"
+    else:
+        outcome = "refused"
+
+    final_report = response["messages"][-1].content
+
+    audit_trail = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp_start": timestamp_start,
+        "timestamp_end": timestamp_end,
+        "watch_list": watchlist_stocks,
+        "tool_calls": tool_calls,
+        "reasoning": [
+            msg.content
+            for msg in response["messages"]
+            if isinstance(msg, AIMessage) and msg.content
+        ],
+        "final_report": final_report,
+        "outcome": outcome,
+        "envelope_decisions": [],
+    }
+
+    ts_for_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    blob_name = (
+        f"{ts_for_name}_{'_'.join(watchlist_stocks)}_{audit_trail['run_id']}.json"
+    )
+    runs_container.upload_blob(
+        name=blob_name,
+        data=json.dumps(audit_trail, indent=2).encode("utf-8"),
+        overwrite=False,
+    )
+    print(f"\n[AUDIT] Run persisted to runs/{blob_name}")
     return response["messages"][-1].content
 
 
 if __name__ == "__main__":
-    # Test the entire autonomous flow for a single stock
+
     print("Launching SentinEdge Agent...")
-    final_report = run_sentinedge_agent(["TSLA"])
+    final_report = run_sentinedge_agent(["TSLA, AAPL"])
     print("\n[FINAL REPORT]:\n", final_report)
